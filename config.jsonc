@@ -1,0 +1,32 @@
+{
+	"https": true,
+	"ssl": {
+		// use certbot or the ssl/gen.sh script for self signed dev certificates
+		"private": "/home/batman/telepresence/ui/phntm_bridge_ui/ssl/private.key.pem",
+		"public": "/home/batman/telepresence/ui/phntm_bridge_ui/ssl/public.cert.pem"
+	},
+	"port": 8443,
+	"host": "100.102.67.64", // Only informational, included in startup logs
+	"path": "/", // base address of the UI (ID_ROBOT will be appended)
+
+	// address where robot's Bridge Server instance will be requested
+	// "bridgeLocateUrl": "https://register.phntm.io/locate",
+    "bridgeLocateUrl": "https://100.102.234.1:3000/locate",
+
+	"bridgeSocketPort": 1337, // Bridge Server port for Socket.io
+	"bridgeFilesPort": 1338, // Bridge Server port for file requests
+
+	// app credentials generated upon registration on Bridge Server
+	"appId": "69f29900b1c58ad3a8ea6bb6",
+	"appKey": "69f29900b1c58ad3a8ea6bb5",
+	"name": "Phntm Bridge Web UI",
+
+	// lines of an analytics tracker code to be appended to HTML
+	"analyticsCode": [],
+
+	// Prometheus metrics endpoint (scraped by Prometheus, visualized in Grafana)
+	"metrics": {
+		"enabled": true,
+		"path": "/metrics" // GET this path to scrape; defaults to /metrics
+	}
+}

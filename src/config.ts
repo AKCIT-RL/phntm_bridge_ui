@@ -37,6 +37,10 @@ const fullConfigSchema = z.object({
 	appId: z.string(),
 	appKey: z.string(),
 	analyticsCode: z.array(z.string()).default([]),
+	metrics: z.object({
+		enabled: z.boolean().default(true),
+		path: z.string().default("/metrics"),
+	}).default({}),
 });
 
 export async function getConfig() {

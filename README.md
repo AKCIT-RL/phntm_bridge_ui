@@ -79,3 +79,79 @@ sudo git config --global --add safe.directory /home/ubuntu/phntm_bridge_ui
 sudo systemctl start phntm_bridge_ui.service
 sudo systemctl enable phntm_bridge_ui.service # will launch on boot
 ```
+---
+
+# Métricas 
+
+O servidor expõe um endpoint de scrape para o [Prometheus](https://prometheus.io/) e aceita estatísticas WebRTC enviadas pelo navegador. Isso permite monitorar em tempo real a saúde do servidor e a qualidade das conexões WebRTC por sessão no Grafana.
+
+
+## Configuração de métricas
+
+Esse bloco foi adicionado em `config.jsonc`
+
+```jsonc
+"metrics": {
+  "enabled": true,
+  "path": "/metrics"
+}
+```
+
+## Métricas expostas
+
+| Métrica | Tipo | Labels | Descrição |
+|---|---|---|---|
+| `phntm_http_requests_total` | Counter | `method`, `status_code` | Total de requisições HTTP |
+| `phntm_webrtc_rtt_seconds` | Gauge | `robot_id`, `session_id` | Round-trip time WebRTC (segundos) |
+| `phntm_webrtc_fps` | Gauge | `robot_id`, `session_id`, `mid` | Frames por segundo (inbound-RTP) |
+| `phntm_webrtc_packets_lost` | Gauge | `robot_id`, `session_id`, `mid` | Pacotes perdidos (acumulado) |
+| `phntm_webrtc_frames_dropped` | Gauge | `robot_id`, `session_id`, `mid` | Frames descartados (acumulado) |
+| `phntm_webrtc_freeze_count` | Gauge | `robot_id`, `session_id`, `mid` | Contagem de congelamentos de vídeo (acumulado) |
+
+As métricas padrão do processo Node.js (`process_cpu_seconds_total`, `nodejs_heap_size_used_bytes`, lag do event-loop, etc.) também são coletadas automaticamente.
+
+## Gerenciamento de sessões
+
+Cada aba do navegador gera um `session_id` único (UUIDv4) no carregamento da página via `crypto.randomUUID()`. Todas as métricas WebRTC são marcadas com esse ID, permitindo filtrar por sessão no Grafana.
+
+```js
+// Ver o ID da sessão atual
+panel_ui.sessionId
+
+// Iniciar uma nova sessão (remove os dados da sessão anterior do Prometheus imediatamente)
+panel_ui.newSession()
+
+// Listar todas as sessões conhecidas pelo servidor
+fetch('/api/metrics/sessions').then(r => r.json()).then(console.log)
+
+// Deletar uma sessão específica
+fetch('/api/metrics/session/<uuid>', { method: 'DELETE' })
+```
+
+> ainda em teste...
+
+## Endpoints da API
+
+| Método | Caminho | Descrição |
+|---|---|---|
+| `GET` | `/metrics` | Endpoint de scrape do Prometheus |
+| `POST` | `/api/metrics/push` | Recebe estatísticas WebRTC do navegador |
+| `GET` | `/api/metrics/sessions` | Lista os IDs de sessão conhecidos |
+| `DELETE` | `/api/metrics/session/:sessionId` | Remove todas as séries de gauge de uma sessão |
+
+## Executando a stack de monitoramento (Prometheus + Grafana)
+
+O Docker Compose completo está incluído no diretório `monitoring/`:
+
+```bash
+cd monitoring
+docker compose up -d
+```
+
+- **Grafana** → `http://localhost:3000` (usuário: admin / senha: admin)
+- **Prometheus** → `http://localhost:9090`
+
+O dashboard do Grafana é provisionado automaticamente e inclui painéis do servidor (taxa de HTTP, memória, CPU, lag do event-loop) e para o WebRTC (RTT, FPS, pacotes perdidos, frames descartados, contagem de congelamentos) com filtros de **Sessão** e **Robô**.
+
+## Configuração do Prometheus e o do Grafana 
+Estão presentes na forma de arquivos yaml no diretório `monitoring/`

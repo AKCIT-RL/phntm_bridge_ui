@@ -219,6 +219,7 @@
 	import { BrowserClient } from "/static/browser-client.js";
 	import { InputManager } from "/static/input/input-manager.js";
 	import { PanelUI } from "/static/panel-ui.js";
+	import { MediaPublisherUI } from "/static/widgets/media-publisher.js";
 
 	// import { LaserOdometryWidget } from "/static/widgets/experimental/laser-odo.js";
 	// import { DescriptionTFWidget } from "/static/widgets/inc/description-tf.js";
@@ -290,6 +291,10 @@
 
 	let background_disconnect_sec = parseFloat('<%= background_disconnect_sec %>');
 	let panel_ui = new PanelUI(robot, 32, input_manager, background_disconnect_sec);
+
+	// allow user to publish browser cam/mic to the connected peer
+	let media_publisher_ui = new MediaPublisherUI(robot);
+	window.media_publisher_ui = media_publisher_ui;
 
 	// add core single type panel widgets
 	let single_type_panel_classes = [ BatteryStateWidget,

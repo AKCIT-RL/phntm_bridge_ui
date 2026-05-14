@@ -1572,6 +1572,15 @@ export class BrowserClient extends EventTarget {
 		console.warn("Clearing session");
 		this.pc_session = null; // pc session
 
+		// stop any locally-published media (cam/mic) if active
+		if (this.published_media_stream) {
+			try {
+				this.published_media_stream.getTracks().forEach((t) => t.stop());
+			} catch (e) { /* ignore */ }
+		}
+		this.published_media_stream = null;
+		this.published_media_tracks = {};
+
 		let that = this;
 		Object.keys(this.topic_writers).forEach((topic) => {
 			if (that.topic_writers[topic].dc) {
@@ -1949,4 +1958,331 @@ export class BrowserClient extends EventTarget {
 		}
 		return null;
 	}
+
+	// =============================================================
+	// Browser-side media publishing (camera/mic -> peer ROS topics)
+	//
+	// Captures the user's camera and/or microphone via getUserMedia
+	// and pushes encoded frames as standard ROS messages over the
+	// existing WebRTC data channel pipeline (openWriteChannel /
+	// writeTopicData). This piggybacks on the same signaling path
+	// as any other publishing topic ("subscribe:write") and requires
+	// no new socket events or backend changes.
+	//
+	// Default ROS message types:
+	//   video -> sensor_msgs/msg/CompressedImage  (JPEG)
+	//   audio -> audio_common_msgs/msg/AudioData  (int16 PCM, mono)
+	// Both can be overridden through publishMedia({ video.msg_type,
+	// audio.msg_type }) if the robot expects different types.
+	// =============================================================
+
+	async listMediaInputDevices() {
+		if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+			return { video: [], audio: [] };
+		}
+		// Request permission once so device labels are populated
+		try {
+			let tmp = await navigator.mediaDevices.getUserMedia({
+				video: true,
+				audio: true,
+			});
+			tmp.getTracks().forEach((t) => t.stop());
+		} catch (e) {
+			try {
+				let tmp = await navigator.mediaDevices.getUserMedia({ video: true });
+				tmp.getTracks().forEach((t) => t.stop());
+			} catch (_) { /* ignore */ }
+			try {
+				let tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+				tmp.getTracks().forEach((t) => t.stop());
+			} catch (_) { /* ignore */ }
+		}
+		let devs = await navigator.mediaDevices.enumerateDevices();
+		return {
+			video: devs.filter((d) => d.kind === "videoinput"),
+			audio: devs.filter((d) => d.kind === "audioinput"),
+		};
+	}
+
+	isPublishingMedia() {
+		return !!(this._media_pub && (this._media_pub.video || this._media_pub.audio));
+	}
+
+	getPublishedMediaInfo() {
+		if (!this.isPublishingMedia()) return null;
+		let info = [];
+		if (this._media_pub.video) {
+			info.push({
+				kind: "video",
+				topic: this._media_pub.video.topic,
+				msg_type: this._media_pub.video.msg_type,
+				label: this._media_pub.video.label,
+			});
+		}
+		if (this._media_pub.audio) {
+			info.push({
+				kind: "audio",
+				topic: this._media_pub.audio.topic,
+				msg_type: this._media_pub.audio.msg_type,
+				label: this._media_pub.audio.label,
+			});
+		}
+		return info;
+	}
+
+	/**
+	 * Start publishing local camera/mic to the connected peer as ROS topics.
+	 * @param {Object} opts
+	 * @param {Object|null} [opts.video] { topic, deviceId?, width?, height?, fps?, jpegQuality?, msg_type? }
+	 * @param {Object|null} [opts.audio] { topic, deviceId?, sampleRate?, msg_type? }
+	 * @returns {Promise<{success: boolean, error?: string}>}
+	 */
+	async publishMedia(opts) {
+		if (!this.pc || this.pc.connectionState !== "connected") {
+			return { success: false, error: "Peer connection not ready" };
+		}
+		if (this.isPublishingMedia()) {
+			return { success: false, error: "Already publishing media" };
+		}
+		const video = opts && opts.video ? opts.video : null;
+		const audio = opts && opts.audio ? opts.audio : null;
+		if (!video && !audio) {
+			return { success: false, error: "No video or audio configured" };
+		}
+		if (video && (!video.topic || !video.topic.trim())) {
+			return { success: false, error: "Video topic is required" };
+		}
+		if (audio && (!audio.topic || !audio.topic.trim())) {
+			return { success: false, error: "Audio topic is required" };
+		}
+
+		let constraints = {};
+		if (video) {
+			constraints.video = {};
+			if (video.deviceId) constraints.video.deviceId = { exact: video.deviceId };
+			if (video.width) constraints.video.width = { ideal: parseInt(video.width) };
+			if (video.height) constraints.video.height = { ideal: parseInt(video.height) };
+			if (video.fps) constraints.video.frameRate = { ideal: parseFloat(video.fps) };
+			if (Object.keys(constraints.video).length === 0) constraints.video = true;
+		}
+		if (audio) {
+			constraints.audio = audio.deviceId
+				? { deviceId: { exact: audio.deviceId } }
+				: true;
+		}
+
+		let stream;
+		try {
+			stream = await navigator.mediaDevices.getUserMedia(constraints);
+		} catch (e) {
+			console.error("getUserMedia failed", e);
+			return { success: false, error: "getUserMedia failed: " + e.message };
+		}
+
+		this._media_pub = {
+			stream: stream,
+			video: null,
+			audio: null,
+		};
+
+		// ---------- VIDEO ----------
+		const videoTrack = stream.getVideoTracks()[0];
+		if (video && videoTrack) {
+			const videoMsgType = video.msg_type || "sensor_msgs/msg/CompressedImage";
+			const videoTopic = video.topic.trim();
+			const errOut = {};
+			const ok = this.openWriteChannel(videoTopic, videoMsgType, errOut);
+			if (!ok) {
+				await this._teardownPublishedMedia();
+				return {
+					success: false,
+					error: errOut.message || "Failed opening video write channel",
+				};
+			}
+			this._media_pub.video = {
+				topic: videoTopic,
+				msg_type: videoMsgType,
+				track: videoTrack,
+				label: videoTrack.label,
+				targetFps: parseFloat(video.fps) || 15,
+				quality: typeof video.jpegQuality === "number" ? video.jpegQuality : 0.7,
+				frame_id: video.frame_id || "browser_camera",
+				seq: 0,
+				running: true,
+			};
+			this._startVideoPublishLoop(this._media_pub.video);
+		}
+
+		// ---------- AUDIO ----------
+		const audioTrack = stream.getAudioTracks()[0];
+		if (audio && audioTrack) {
+			const audioMsgType = audio.msg_type || "audio_common_msgs/msg/AudioData";
+			const audioTopic = audio.topic.trim();
+			const errOut = {};
+			const ok = this.openWriteChannel(audioTopic, audioMsgType, errOut);
+			if (!ok) {
+				await this._teardownPublishedMedia();
+				return {
+					success: false,
+					error: errOut.message || "Failed opening audio write channel",
+				};
+			}
+			try {
+				await this._startAudioPublishLoop({
+					topic: audioTopic,
+					msg_type: audioMsgType,
+					stream: stream,
+					track: audioTrack,
+					sampleRate: parseInt(audio.sampleRate) || 16000,
+				});
+			} catch (e) {
+				console.error("Audio capture failed", e);
+				await this._teardownPublishedMedia();
+				return { success: false, error: "Audio capture failed: " + e.message };
+			}
+		}
+
+		this.emit("media_publish_started", this.getPublishedMediaInfo());
+		return { success: true };
+	}
+
+	async stopPublishingMedia() {
+		if (!this.isPublishingMedia()) return { success: true };
+		await this._teardownPublishedMedia();
+		this.emit("media_publish_stopped");
+		return { success: true };
+	}
+
+	async _teardownPublishedMedia() {
+		if (!this._media_pub) return;
+		const pub = this._media_pub;
+		this._media_pub = null; // signal loops to stop
+
+		if (pub.video) {
+			pub.video.running = false;
+		}
+		if (pub.audio) {
+			try {
+				if (pub.audio.processor) pub.audio.processor.disconnect();
+				if (pub.audio.source) pub.audio.source.disconnect();
+				if (pub.audio.context && pub.audio.context.state !== "closed") {
+					await pub.audio.context.close();
+				}
+			} catch (e) { /* ignore */ }
+		}
+		if (pub.stream) {
+			try {
+				pub.stream.getTracks().forEach((t) => t.stop());
+			} catch (e) { /* ignore */ }
+		}
+	}
+
+	_startVideoPublishLoop(v) {
+		// Use a hidden <video> + OffscreenCanvas (or canvas) to grab frames
+		// from the MediaStreamTrack and JPEG-encode them.
+		const videoEl = document.createElement("video");
+		videoEl.muted = true;
+		videoEl.playsInline = true;
+		videoEl.autoplay = true;
+		videoEl.srcObject = new MediaStream([v.track]);
+		v.videoEl = videoEl;
+
+		const intervalMs = Math.max(1000.0 / v.targetFps, 30);
+		const that = this;
+
+		const tick = async () => {
+			if (!v.running) return;
+			try {
+				if (videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
+					const w = videoEl.videoWidth;
+					const h = videoEl.videoHeight;
+					if (!v.canvas || v.canvas.width !== w || v.canvas.height !== h) {
+						v.canvas = document.createElement("canvas");
+						v.canvas.width = w;
+						v.canvas.height = h;
+						v.ctx = v.canvas.getContext("2d");
+					}
+					v.ctx.drawImage(videoEl, 0, 0, w, h);
+					const blob = await new Promise((resolve) =>
+						v.canvas.toBlob(resolve, "image/jpeg", v.quality),
+					);
+					if (blob && v.running) {
+						const buf = await blob.arrayBuffer();
+						const data = new Uint8Array(buf);
+						const now = Date.now();
+						const stamp = {
+							sec: Math.floor(now / 1000),
+							nanosec: (now % 1000) * 1000000,
+						};
+						const msg = {
+							header: {
+								stamp: stamp,
+								frame_id: v.frame_id,
+							},
+							format: "jpeg",
+							data: data,
+						};
+						if (!that.writeTopicData(v.topic, msg)) {
+							// not ready yet — silently drop
+						}
+						v.seq++;
+					}
+				}
+			} catch (e) {
+				console.warn("Video publish frame error", e);
+			}
+			if (v.running) {
+				v.timer = setTimeout(tick, intervalMs);
+			}
+		};
+
+		// kick off when video has data
+		const start = () => {
+			if (v.running) tick();
+		};
+		if (videoEl.readyState >= 2) start();
+		else videoEl.addEventListener("loadeddata", start, { once: true });
+	}
+
+	async _startAudioPublishLoop(a) {
+		const AudioCtx = window.AudioContext || window.webkitAudioContext;
+		const ctx = new AudioCtx({ sampleRate: a.sampleRate });
+		const source = ctx.createMediaStreamSource(a.stream);
+		// ScriptProcessorNode is deprecated but ubiquitous; AudioWorklet would
+		// require a separate worklet file. 4096 frames @ given sample rate.
+		const processor = ctx.createScriptProcessor(4096, 1, 1);
+		const that = this;
+
+		processor.onaudioprocess = (ev) => {
+			if (!that._media_pub || !that._media_pub.audio) return;
+			const input = ev.inputBuffer.getChannelData(0); // Float32Array
+			const pcm = new Int16Array(input.length);
+			for (let i = 0; i < input.length; i++) {
+				let s = Math.max(-1, Math.min(1, input[i]));
+				pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+			}
+			// audio_common_msgs/msg/AudioData expects an int16[] field
+			// (named "int16_data" or "data" depending on version). We
+			// populate both common variants to maximize compatibility;
+			// the MessageWriter ignores fields not present in the schema.
+			const msg = {
+				int16_data: pcm,
+				data: pcm,
+			};
+			that.writeTopicData(a.topic, msg);
+		};
+
+		source.connect(processor);
+		processor.connect(ctx.destination);
+
+		this._media_pub.audio = {
+			topic: a.topic,
+			msg_type: a.msg_type,
+			label: a.track ? a.track.label : "",
+			context: ctx,
+			source: source,
+			processor: processor,
+		};
+	}
 }
+

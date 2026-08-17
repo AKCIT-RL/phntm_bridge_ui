@@ -106,6 +106,40 @@ export function IsFastVideoTopic(t) {
 }
 
 export class BrowserClient extends EventTarget {
+	id_robot = null;
+	pc_session = null;
+	id_instance = null;
+
+	supported_msg_types = []; // served from Bridge Server
+
+	pc = null;
+	socket = null;
+
+	discovered_topics = {}; // str topic => { msg_types: str[], subscribed: bool }
+	discovered_nodes = {}; // str node => { msg_type: str}
+	discovered_services = {}; // str service => { msg_type: str}
+
+	topic_streams = {}; // topic/cam => id_stream
+	open_media_streams = {}; // id_stream => { mid: string, stream: MediaStream } 
+	read_audio_channels = [];
+
+	event_calbacks = {};
+	topic_calbacks = {};
+	topic_config_callbacks = {};
+	service_config_callbacks = {};
+	ui_config_callbacks = [];
+
+	service_request_callbacks = {};
+	service_reply_callbacks = {};
+	default_service_timeout_sec = 10.0; // overwritten by ui config
+
+	ui_config = {};
+	prefixed_configs = {};
+	prefixed_configs_received = false;
+	input_manager = null;
+	extrernal_scripts = {};
+
+	is_waiting = false;
 
 	constructor(opts) {
 		super();
@@ -1286,6 +1320,12 @@ export class BrowserClient extends EventTarget {
 				// 	that.emitTopicConfig(topic, null);
 				// }
 			});
+		}
+
+		if (robot_data["read_audio_channels"]) {
+			console.log("Got read audio channels", robot_data["read_audio_channels"]);
+			this.read_audio_channels = robot_data["read_audio_channels"];
+			this.emit("read_audio_channels", this.read_audio_channels);
 		}
 
 		if (robot_data["write_data_channels"]) {

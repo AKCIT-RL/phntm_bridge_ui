@@ -51,7 +51,7 @@
       if (this.audioContext.state === "running") {
         this.started = true;
         if (this.nextPlaybackTime < this.audioContext.currentTime) {
-          this.nextPlaybackTime = this.audioContext.currentTime + 0.02;
+          this.nextPlaybackTime = this.audioContext.currentTime + this.playoutDelay;
         }
         this.flushAllQueues();
       }
@@ -345,17 +345,18 @@
         this.nextPlaybackTime = now + (this.playoutDelay || 0.1);
       }
 
-      const currentLag = this.nextPlaybackTime - now;
+      let currentLag = this.nextPlaybackTime - now;
 
-      let speed = 1.0;
-
-      if (currentLag > 0.25) {
-        speed = 1.25;
-      } else if (currentLag > 0.12) {
-        speed = 1.10;
-      } else {
-        speed = 1.0;
+      if (currentLag > this.maxAllowedDelay * 3) {
+        console.warn("[miss_mic_audio] Atraso extremo, ressincronizando (último recurso).");
+        this.nextPlaybackTime = now + this.playoutDelay;
+        currentLag = this.playoutDelay;
       }
+
+      const excessLag = Math.max(0, currentLag - this.playoutDelay);
+      const maxExtraSpeed = 0.5; // teto: até 1.5x quando o atraso for grande
+      const catchUpWindow = 0.6; // em quantos segundos de atraso extra chegamos ao teto
+      const speed = 1.0 + Math.min(excessLag / catchUpWindow, 1) * maxExtraSpeed;
 
       // --- PRESERVAÇÃO DE TOM DE VOZ (PITCH) ---
       src.playbackRate.value = speed;
